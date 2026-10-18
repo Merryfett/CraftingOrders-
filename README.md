@@ -93,16 +93,3 @@ Open the crafting table, switch to the Patron tab, and you can quickly spot:
 - orders you cannot currently craft because the recipe is unknown
 
 The result is a Patron list that is much better for planning, triage, and making gold-aware decisions without leaving the Blizzard professions UI.
-
-## Development and validation
-
-Order preparation runs cooperatively across frames while the last complete list remains visible. The worker targets a 2 ms slice and yields between Lua steps/native calls; a single native call can exceed the target. Quality planning, mixed-quality materials, concentration estimates, pricing, warnings, filters and native order-opening behavior remain available.
-
-Run the offline regression suite with Python 3.13 and Git:
-
-```sh
-python -m pip install -r tests/requirements.txt
-python tests/run_tests.py
-```
-
-The suite uses a Lua 5.1 runtime with mocked WoW APIs. It checks correctness and scheduling, but does not measure live game performance or replace in-game UI testing. See [test coverage and contribution sources](tests/README.md).
