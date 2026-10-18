@@ -6,6 +6,7 @@ local Pane = ns.BrowsePane
 local Pricing = ns.Pricing
 local Util = ns.Util
 local L = ns.L
+local PreparationWork = ns.PreparationWork
 
 local function LF(key, ...)
 	if ns.LF then
@@ -1017,6 +1018,7 @@ local function GetRecipeSchematic(recipeInfo)
 end
 
 local function GetOperationInfo(orderData, reagents, applyConcentration)
+	PreparationWork:Checkpoint()
 	if not (orderData and orderData.recipeInfo and orderData.recipeInfo.recipeID and C_TradeSkillUI) then
 		return nil
 	end
@@ -1506,6 +1508,7 @@ local function BuildSlotFillVariants(slotData, allowEmpty)
 
 	local components = {}
 	local function Visit(optionIndex, remaining)
+		PreparationWork:Checkpoint()
 		local option = options[optionIndex]
 		if remaining == 0 then
 			variants[#variants + 1] = CreateMaterialVariant(slotData, components)
@@ -1543,7 +1546,7 @@ local function BuildSlotFillVariants(slotData, allowEmpty)
 	end
 
 	Visit(1, slotData.quantityRequired or 0)
-	table.sort(variants, CompareMaterialPlanPreference)
+	PreparationWork:Sort(variants, CompareMaterialPlanPreference)
 	return variants
 end
 
@@ -1628,9 +1631,17 @@ local function BuildLowestMaterialPlan(orderData)
 
 	for _, slotData in ipairs(orderData.mutableSlots or {}) do
 		if slotData.dataSlotType == MUTABLE_SLOT_TYPE and not slotData.covered and not slotData.locked and slotData.required then
-			local variants = BuildSlotFillVariants(slotData, false)
-			if variants[1] then
-				selections[#selections + 1] = variants[1]
+			-- The lowest plan has no quality constraint: its objective is linear
+			-- in quantity. A mixture cannot beat the best single-option fill.
+			-- Avoid enumerating every distribution just to take the first one.
+			local best
+			for _, option in ipairs(slotData.options or EMPTY_LIST) do
+				PreparationWork:Checkpoint()
+				local candidate = CreateMaterialVariant(slotData, {{option = option, quantity = slotData.quantityRequired}})
+				if not best or CompareMaterialPlanPreference(candidate, best) then best = candidate end
+			end
+			if best then
+				selections[#selections + 1] = best
 			else
 				missingRequiredSlots = missingRequiredSlots + 1
 			end
@@ -1683,6 +1694,7 @@ local function FindReachableMaterialPlan(orderData, requiredQuality)
 	local selections = {}
 
 	local function Search(slotIndex, currentQualityWeight)
+		PreparationWork:Checkpoint()
 		if slotIndex > #planningSlots then
 			local candidate = BuildPlannedMaterialCombination(orderData, selections, 0)
 			if CanReachRequiredQuality(candidate.operationInfo, requiredQuality)
@@ -2102,7 +2114,7 @@ local function EstimateConcentrationCost(orderData, inventoryOnly, preferHighSco
 	return operationInfo.concentrationCost or 0, operationInfo
 end
 
-local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedReagents)
+local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedReagents, warningsOnly)
 	local coveredSlots = {}
 	for _, suppliedReagent in ipairs(suppliedReagents or EMPTY_LIST) do
 		if suppliedReagent.slotIndex then
@@ -2121,6 +2133,7 @@ local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedR
 	local slotMap = {}
 
 	for _, slot in ipairs(reagentSlotSchematics or EMPTY_LIST) do
+		PreparationWork:Checkpoint()
 		local slotData = {
 			slotIndex = slot.slotIndex,
 			dataSlotType = slot.dataSlotType,
@@ -2136,6 +2149,7 @@ local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedR
 
 		if not slotData.covered then
 			for _, reagent in ipairs(slot.reagents or {}) do
+				PreparationWork:Checkpoint()
 				if reagent.itemID then
 					local itemLink = reagent.itemLink or reagent.hyperlink or Util.GetItemLink(reagent.itemID)
 					local itemIdentity = GetReagentItemIdentity(reagent.itemID, itemLink)
@@ -2192,6 +2206,9 @@ local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedR
 	orderData.mutableSlots = mutableSlots
 	orderData.staticMaterialEntries = staticMaterialEntries
 	orderData.staticMissingRequiredSlots = staticMissingRequiredSlots
+	-- Price warnings only need the slot options. Do not run quality searches,
+	-- concentration simulations or material-plan generation on every item event.
+	if warningsOnly then return end
 	orderData.operationReagents, orderData.baseOperation = CreateOperationContext(orderData, suppliedReagents)
 
 	for _, slotData in ipairs(mutableSlots) do
@@ -2346,7 +2363,7 @@ local function CollectUnresolvedItemIDs(orderData)
 		TrackUnresolvedItemID(unresolvedItemIDs, rewardIcon.itemID)
 	end
 
-	for _, slotData in ipairs(orderData.requiredReagents or EMPTY_LIST) do
+	for _, slotData in pairs(orderData.slotMap or orderData.requiredReagents or EMPTY_LIST) do
 		for _, option in ipairs(slotData.options or EMPTY_LIST) do
 			TrackUnresolvedItemID(unresolvedItemIDs, option.itemID)
 		end
@@ -2362,11 +2379,18 @@ local function OrderHasUnresolvedItemData(orderData)
 	return next(orderData.unresolvedItemIDs or EMPTY_LIST) ~= nil
 end
 
-local function PrepareOrder(rawOrder)
+local function PrepareOrder(rawOrder, warningsOnly)
+	PreparationWork:Checkpoint()
 	local recipeInfo = GetRecipeInfo(rawOrder)
 	local recipeSchematic = recipeInfo and GetRecipeSchematic(recipeInfo)
 	if not (recipeInfo and recipeSchematic) then
 		return nil
+	end
+	if warningsOnly then
+		local data = {orderID = rawOrder.orderID, recipeInfo = recipeInfo}
+		BuildRequiredReagents(data, recipeSchematic.reagentSlotSchematics, rawOrder.reagents, true)
+		data.unresolvedItemIDs = CollectUnresolvedItemIDs(data)
+		return data
 	end
 
 	local output = GetOutputPresentation(rawOrder, recipeInfo)
@@ -2386,7 +2410,7 @@ local function PrepareOrder(rawOrder)
 		canSkillUp = recipeInfo.canSkillUp,
 		relativeDifficulty = recipeInfo.relativeDifficulty,
 		skillUps = recipeInfo.numSkillUps or 0,
-		unknownRecipeTooltip = isKnown and nil or BuildUnknownRecipeTooltip(recipeInfo),
+		unknownRecipeTooltip = not isKnown and BuildUnknownRecipeTooltip(recipeInfo) or nil,
 		reward = rewardData,
 	}
 
@@ -2732,17 +2756,27 @@ function Pane:RefreshDetailWarningOrderData(orderInfo)
 		self.detailWarningOrderID = nil
 		self.detailWarningOrderData = nil
 		self.detailWarningDataDirty = nil
+		self.detailWarningFingerprint = nil
 		return nil
 	end
 
+	local fingerprint = BuildOrderFingerprint(orderInfo)
 	if not self.detailWarningDataDirty
 		and self.detailWarningOrderID == orderInfo.orderID
+		and self.detailWarningFingerprint == fingerprint
 		and self.detailWarningOrderData then
 		return self.detailWarningOrderData
 	end
 
 	self.detailWarningOrderID = orderInfo.orderID
-	self.detailWarningOrderData = PrepareOrder(orderInfo)
+	self.detailWarningFingerprint = fingerprint
+	local cached = self.preparedOrderCache[orderInfo.orderID]
+	if not self.detailWarningDataDirty and cached
+		and cached.fingerprint == fingerprint and cached.generation == self.rebuildGeneration then
+		self.detailWarningOrderData = cached.data
+	else
+		self.detailWarningOrderData = PrepareOrder(orderInfo, true)
+	end
 	self.detailWarningDataDirty = nil
 	return self.detailWarningOrderData
 end
@@ -4193,6 +4227,10 @@ function Pane:BuildFrame()
 		Pane:BeginVisibleSession()
 		Pane:MarkDirty("show")
 	end)
+	root:SetScript("OnHide", function()
+		Pane:CancelPreparation()
+		Pane.trailingDirtyTokens = nil
+	end)
 	root:SetScript("OnUpdate", function(_, elapsed)
 		Pane.elapsedSinceTick = (Pane.elapsedSinceTick or 0) + elapsed
 
@@ -4724,6 +4762,8 @@ function Pane:PruneSelectedOrders()
 end
 
 function Pane:ClearVisibleOrders(profession)
+	self:CancelPreparation()
+	self.preparedOrderCache = {}
 	self.allOrders = {}
 	self.orders = {}
 	self.ordersProfession = profession
@@ -4763,7 +4803,17 @@ function Pane:BeginVisibleSession()
 end
 
 function Pane:BumpPreparedOrderGeneration()
+	self:CancelPreparation()
 	self.rebuildGeneration = (self.rebuildGeneration or 0) + 1
+end
+
+function Pane:CancelPreparation()
+	if self.preparationPending then
+		PreparationWork:Cancel()
+		self.preparationPending = nil
+		-- A cancelled refresh must be retried when the panel is reopened.
+		self.ordersGeneration = -1
+	end
 end
 
 function Pane:ChoosePendingReason(reason)
@@ -4829,7 +4879,7 @@ function Pane:UpdateEmptyState()
 
 	local hasOrders = #(self.orders or EMPTY_LIST) > 0
 	local hasPreparedOrders = #(self.allOrders or EMPTY_LIST) > 0
-	local isLoading = not hasOrders and self:IsLoadingOrders()
+	local isLoading = not hasOrders and (self:IsLoadingOrders() or self.preparationPending)
 	local emptyText = EMPTY_STATE_EMPTY_TEXT
 	if not isLoading and not hasOrders and hasPreparedOrders and self:HasActiveFilters() then
 		emptyText = EMPTY_STATE_FILTERED_TEXT
@@ -4853,8 +4903,14 @@ function Pane:MarkDirty(reason)
 	local professionChanged = false
 	local configKey = GetConfigKeyFromReason(reason)
 
-	if DoesReasonBumpGeneration(reason) or (reason == "item-data" and self.hasUnresolvedItemData) then
+	if DoesReasonBumpGeneration(reason) then
 		self:BumpPreparedOrderGeneration()
+	end
+	if reason == "item-data" then
+		-- Reuse complete orders when only missing item data changed.
+		for _, cached in pairs(self.preparedOrderCache) do
+			if cached.hasUnresolvedItemData then cached.generation = -1 end
+		end
 	end
 
 	if isVisible then
@@ -4886,6 +4942,9 @@ function Pane:MarkDirty(reason)
 		self.needsRebuild = true
 	elseif IsRenderOnlyConfigKey(configKey) then
 		self.needsRender = true
+	end
+	if self.needsRebuild and reason ~= "sort" and reason ~= "filter" then
+		self:CancelPreparation()
 	end
 
 	if not isVisible then
@@ -5053,49 +5112,72 @@ function Pane:RebuildPreparedOrders()
 		return false
 	end
 
-	local preparedOrders = {}
-	local preparedOrderCache = {}
-	local hasUnresolvedItemData = false
-	local unresolvedItemIDs = {}
+	self:CancelPreparation()
+	local generation = self.rebuildGeneration
+	local session = self.visibleSessionId
+	local serial = (self.preparationSerial or 0) + 1
+	self.preparationSerial = serial
+	self.preparationPending = true
+	self:UpdateEmptyState()
 
-	for _, rawOrder in ipairs(rawOrders) do
-		local fingerprint = BuildOrderFingerprint(rawOrder)
-		local cacheEntry = self.preparedOrderCache[rawOrder.orderID]
-		local orderData
-
-		if cacheEntry
-			and cacheEntry.fingerprint == fingerprint
-			and cacheEntry.generation == self.rebuildGeneration then
-			orderData = cacheEntry.data
-			hasUnresolvedItemData = hasUnresolvedItemData or not not cacheEntry.hasUnresolvedItemData
-		else
-			orderData = PrepareOrder(rawOrder)
-			hasUnresolvedItemData = hasUnresolvedItemData or not not (orderData and orderData.hasUnresolvedItemData)
-		end
-
-		if orderData then
-			preparedOrders[#preparedOrders + 1] = orderData
-			for itemID in pairs(orderData.unresolvedItemIDs or EMPTY_LIST) do
-				unresolvedItemIDs[itemID] = true
+	PreparationWork:Start(function()
+		local preparedOrders, preparedOrderCache, unresolvedItemIDs = {}, {}, {}
+		for _, rawOrder in ipairs(rawOrders) do
+			PreparationWork:Checkpoint()
+			local fingerprint = BuildOrderFingerprint(rawOrder)
+			local cached = self.preparedOrderCache[rawOrder.orderID]
+			local orderData
+			if cached and cached.fingerprint == fingerprint and cached.generation == generation then
+				orderData = cached.data
+			else
+				orderData = PrepareOrder(rawOrder)
 			end
-			preparedOrderCache[rawOrder.orderID] = {
-				fingerprint = fingerprint,
-				generation = self.rebuildGeneration,
-				data = orderData,
-				hasUnresolvedItemData = orderData.hasUnresolvedItemData or false,
-			}
+			if orderData then
+				preparedOrders[#preparedOrders + 1] = orderData
+				for itemID in pairs(orderData.unresolvedItemIDs or EMPTY_LIST) do
+					unresolvedItemIDs[itemID] = true
+				end
+				preparedOrderCache[rawOrder.orderID] = {
+					fingerprint = fingerprint, generation = generation, data = orderData,
+					hasUnresolvedItemData = orderData.hasUnresolvedItemData or false,
+				}
+			end
 		end
-	end
-
-	self.preparedOrderCache = preparedOrderCache
-	self.allOrders = preparedOrders
-	self:ApplyOrderFilters()
-	self.ordersProfession = currentProfession
-	self.ordersGeneration = self.rebuildGeneration
-	self.hasUnresolvedItemData = hasUnresolvedItemData
-	self.unresolvedItemIDs = unresolvedItemIDs
-	self:PruneSelectedOrders()
-	return true
+		return {orders = preparedOrders, cache = preparedOrderCache, unresolved = unresolvedItemIDs}
+	end, function()
+		return self.preparationSerial == serial and self.rebuildGeneration == generation
+			and self.visibleSessionId == session and self.root and self.root:IsShown()
+			and self:GetCurrentProfessionID() == currentProfession
+	end, function(result)
+		-- Commit a complete snapshot. Existing rows stay usable during preparation.
+		self.preparationPending = nil
+		self.preparedOrderCache = result.cache
+		self.allOrders = result.orders
+		self.ordersProfession = currentProfession
+		self.ordersGeneration = generation
+		self.unresolvedItemIDs = result.unresolved
+		self.hasUnresolvedItemData = next(result.unresolved) ~= nil
+		self:PruneSelectedOrders()
+		self.needsRender = true
+		self:SchedulePendingRefresh("prepared", 0)
+		-- Item data may have arrived while a calculation was suspended, before
+		-- the new unresolved-ID set was visible to our event handler.
+		for itemID in pairs(result.unresolved) do
+			if not IsItemDataPending(itemID) then
+				self:ScheduleTrailingDirty("item-data", ITEM_DATA_REFRESH_DELAY)
+				break
+			end
+		end
+	end, function(invalidated)
+		if self.preparationSerial ~= serial then return end
+		self.preparationPending = nil
+		self.ordersGeneration = -1
+		if invalidated and self.root and self.root:IsShown() then
+			self.needsRebuild = true
+			self:SchedulePendingRefresh("trade-skill-source", 0)
+		end
+	end)
+	return false
 end
 
 function Pane:ProcessPendingRefresh()
@@ -5139,6 +5221,7 @@ function Pane:SetCustomPaneShown(isShown)
 	if isShown then
 		self:ApplyReferenceLayout()
 	else
+		self:CancelPreparation()
 		if self.filterPanel then
 			self.filterPanel:Hide()
 		end
@@ -5300,17 +5383,21 @@ end
 
 function Pane:ScheduleTrailingDirty(reason, delay)
 	self.trailingDirtyTokens = self.trailingDirtyTokens or {}
-	local token = (self.trailingDirtyTokens[reason] or 0) + 1
-	self.trailingDirtyTokens[reason] = token
-
-	C_Timer.After(delay or 0, function()
-		if not Pane or not Pane.trailingDirtyTokens or Pane.trailingDirtyTokens[reason] ~= token then
-			return
-		end
-
+	local pending = self.trailingDirtyTokens[reason]
+	if pending then
+		pending.dueAt = GetTime() + (delay or 0)
+		return
+	end
+	pending = {dueAt = GetTime() + (delay or 0)}
+	self.trailingDirtyTokens[reason] = pending
+	local function Flush()
+		if not Pane.trailingDirtyTokens or Pane.trailingDirtyTokens[reason] ~= pending then return end
+		local remaining = pending.dueAt - GetTime()
+		if remaining > 0 then C_Timer.After(remaining, Flush); return end
 		Pane.trailingDirtyTokens[reason] = nil
 		Pane:MarkDirty(reason)
-	end)
+	end
+	C_Timer.After(delay or 0, Flush)
 end
 
 function Pane:InitializeEvents()
@@ -5341,7 +5428,10 @@ function Pane:InitializeEvents()
 			and Pane.unresolvedItemIDs[itemID] then
 			Pane:ScheduleTrailingDirty("item-data", ITEM_DATA_REFRESH_DELAY)
 		end
-		Pane:MarkDetailWarningDirty()
+		local detail = Pane.detailWarningOrderData
+		if detail and detail.unresolvedItemIDs and detail.unresolvedItemIDs[itemID] then
+			Pane:MarkDetailWarningDirty()
+		end
 	end)
 
 	ns.RegisterEvent("TRADE_SKILL_DATA_SOURCE_CHANGED", function()
