@@ -139,6 +139,29 @@ for _, required in ipairs({0, 1, 2, 3, 4, 6}) do
 end
 print("PASS: full order results match original across six quality cases; deep search yields within budget")
 
+for _, scenario in ipairs({"no_provider", "all_provided", "unknown_recipe"}) do
+	local old, new = fixture(OLD_SOURCE), fixture(NEW_SOURCE, true)
+	local raw = {orderID = 10, skillLineAbilityID = 1, minQuality = 0, tipAmount = 5000}
+	for _, e in ipairs({old, new}) do
+		e.schematic.reagentSlotSchematics = {slot(1, 4)}
+		if scenario == "no_provider" then
+			e.ns.Pricing.GetPriceInfo = function() return {state = "no_provider"} end
+		elseif scenario == "unknown_recipe" then
+			e.recipe.learned = false
+		end
+	end
+	if scenario == "all_provided" then raw.reagents = {{slotIndex = 1, reagentInfo = {itemID = 11, quantity = 4}}} end
+	local expected, actual = old.ns.test.PrepareOrder(raw)
+	new.ns.PreparationWork:Start(function() return new.ns.test.PrepareOrder(raw) end,
+		function() return true end, function(result) actual = result end)
+	new:drain()
+	equal(summary(actual), summary(expected), scenario)
+	if scenario == "unknown_recipe" then
+		assert(actual.unknownRecipeTooltip and #actual.unknownRecipeTooltip > 0, "unknown-recipe tooltip removed")
+	elseif scenario == "all_provided" then equal(#actual.materialPlan.entries, 0) end
+end
+print("PASS: no pricing provider, fully supplied orders and unknown-recipe tooltips retain upstream results")
+
 -- Exhaustively compare the new linear lowest-fill shortcut to the original
 -- combinatorial solver across mixed qualities, unknown prices and exclusions.
 math.randomseed(8241)
@@ -290,3 +313,19 @@ e.ns.PreparationWork:Start(function() valid = false; return {} end,
 e:step()
 equal(completed, false); equal(invalidated, true); equal(e.ns.PreparationWork.job, nil)
 print("PASS: invalidation during the final calculation cannot leave a pending worker")
+
+local e = fixture(NEW_SOURCE, true)
+local p = e.ns.BrowsePane
+p.visibleSessionId = 4
+p.lastSuccessfulRequest = {visibleSessionId = 4, profession = 1}
+equal(p:ShouldQueueOpenRequest(1), false, "successful empty result triggered polling")
+equal(p:ShouldQueueOpenRequest(2), true, "new profession not requested")
+p.lastTimedOutRequest = {visibleSessionId = 4, profession = 1}
+equal(p:ShouldQueueOpenRequest(1), true, "timeout stopped retrying")
+p.visibleSessionId = 5
+equal(p:ShouldQueueOpenRequest(1), true, "new visible session not requested")
+p:InitializeEvents()
+p.detailWarningOrderData = {unresolvedItemIDs = {[11] = true}}
+e.callbacks.ITEM_DATA_LOAD_RESULT(nil, 11, false)
+equal(p.detailWarningDataDirty, nil, "failed item load queued another rebuild")
+print("PASS: completed empty requests stop polling; timeout/session retries and failed-item handling remain correct")

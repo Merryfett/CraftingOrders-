@@ -3693,14 +3693,16 @@ function Pane:UpdateToolbar()
 	self:UpdateFilterPanel()
 end
 
-function Pane:CollectShoppingEntries()
+function Pane:CollectShoppingEntries(includeOwned)
 	local grouped = {}
 	local selectedOrders = 0
+	local selectedOrderIDs = {}
 	local skippedEntries = 0
 
 	for _, order in ipairs(self.orders) do
 		if self.selectedOrderIDs[order.orderID] then
 			selectedOrders = selectedOrders + 1
+			selectedOrderIDs[order.orderID] = true
 			for _, materialEntry in ipairs(GetMaterialPlanEntries(order)) do
 				local option = materialEntry.option
 				if option and option.itemID and self:IsDontBuyItem(option.itemID) then
@@ -3725,6 +3727,7 @@ function Pane:CollectShoppingEntries()
 							name = option.name,
 							reagentQuality = reagentQuality,
 							required = 0,
+							orderQuantities = {},
 							unitPrice = option.unitPrice,
 							isMarketable = option.isMarketable,
 						}
@@ -3734,6 +3737,7 @@ function Pane:CollectShoppingEntries()
 						bucket.itemIdentity = itemIdentity
 					end
 					bucket.required = bucket.required + (materialEntry.quantity or 0)
+					bucket.orderQuantities[order.orderID] = (bucket.orderQuantities[order.orderID] or 0) + (materialEntry.quantity or 0)
 					bucket.unitPrice = bucket.unitPrice or option.unitPrice
 				end
 			end
@@ -3744,7 +3748,7 @@ function Pane:CollectShoppingEntries()
 	for _, entry in pairs(grouped) do
 		local owned = Util.GetQualityAwareItemCounts(entry.itemID, entry.itemLink)
 		local missing = math.max(0, entry.required - owned)
-		if missing > 0 then
+		if missing > 0 or (includeOwned and entry.required > 0) then
 			entry.quantity = missing
 			export[#export + 1] = entry
 		end
@@ -3754,14 +3758,16 @@ function Pane:CollectShoppingEntries()
 		return (left.name or UNKNOWN) < (right.name or UNKNOWN)
 	end)
 
-	return export, selectedOrders, skippedEntries
+	return export, selectedOrders, skippedEntries, selectedOrderIDs
 end
 
 function Pane._MergeShoppingEntry(store, entry)
 	local key = GetShoppingEntryGroupKey(entry)
 	local existing = store[key]
 	if existing then
-		existing.quantity = (existing.quantity or 0) + (entry.quantity or 0)
+		for orderID, quantity in pairs(entry.orderQuantities or EMPTY_LIST) do
+			existing.orderQuantities[orderID] = quantity
+		end
 		if LinkHasDisplayName(entry.itemLink) and not LinkHasDisplayName(existing.itemLink) then
 			existing.itemLink = entry.itemLink
 			existing.itemIdentity = entry.itemIdentity
@@ -3771,29 +3777,33 @@ function Pane._MergeShoppingEntry(store, entry)
 		for field, value in pairs(entry) do
 			copy[field] = value
 		end
+		copy.orderQuantities = {}
+		for orderID, quantity in pairs(entry.orderQuantities or EMPTY_LIST) do
+			copy.orderQuantities[orderID] = quantity
+		end
 		store[key] = copy
 	end
 end
 
-function Pane._StoreSessionShoppingEntries(listName, entries)
-	local store = Pane._sessionShoppingLists[listName] or {}
-	for _, entry in ipairs(entries) do
-		Pane._MergeShoppingEntry(store, entry)
-	end
-	Pane._sessionShoppingLists[listName] = store
-	Pane._lastSessionListName = listName
-	return store
-end
-
-function Pane._FlattenSessionShoppingList(listName)
+function Pane._FlattenSessionShoppingList(listName, store)
 	local flat = {}
-	local store = Pane._sessionShoppingLists[listName]
+	store = store or Pane._sessionShoppingLists[listName]
 	if not store then
 		return flat
 	end
 
 	for _, entry in pairs(store) do
-		flat[#flat + 1] = entry
+		local required = 0
+		for _, quantity in pairs(entry.orderQuantities or EMPTY_LIST) do required = required + quantity end
+		-- Reserve inventory once for the combined requirements, not once per export.
+		local owned = Util.GetQualityAwareItemCounts(entry.itemID, entry.itemLink)
+		local missing = math.max(0, required - owned)
+		if missing > 0 then
+			local copy = {}
+			for field, value in pairs(entry) do copy[field] = value end
+			copy.required, copy.quantity = required, missing
+			flat[#flat + 1] = copy
+		end
 	end
 
 	table.sort(flat, function(left, right)
@@ -3805,17 +3815,18 @@ end
 
 function Pane._GenerateNewSessionListName()
 	local base = LF("SHOPPING_LIST_NAME_FORMAT", Util.GetLocalTimeStamp())
-	if not Pane._sessionShoppingLists[base] then
-		return base
-	end
-
-	-- Same-minute collision (GetLocalTimeStamp only has minute resolution): disambiguate
-	-- instead of silently reusing/overwriting an unrelated list that happens to share a name.
-	local suffix = 2
-	while Pane._sessionShoppingLists[base .. " (" .. suffix .. ")"] do
+	local name, suffix = base, 1
+	while Pane._sessionShoppingLists[name] or Pricing:AuctionatorListExists(name) == true do
 		suffix = suffix + 1
+		name = base .. " (" .. suffix .. ")"
 	end
-	return base .. " (" .. suffix .. ")"
+	if Pricing:AuctionatorListExists(name) == nil then
+		-- If the optional list-manager API is unavailable, use a session-unique
+		-- name rather than risk replacing a persistent list from another login.
+		Pane._listSerial = (Pane._listSerial or 0) + 1
+		name = name .. " (" .. math.floor(GetTime() * 1000) .. "-" .. Pane._listSerial .. ")"
+	end
+	return name
 end
 
 StaticPopupDialogs["CRAFTINGORDERSPP_MERGE_SHOPPING_LIST"] = {
@@ -3825,35 +3836,67 @@ StaticPopupDialogs["CRAFTINGORDERSPP_MERGE_SHOPPING_LIST"] = {
 	button3 = CANCEL,
 	OnAccept = function(_, data)
 		if data and data.entries then
-			Pane:FinalizeShoppingList("merge", data.entries)
+			Pane:FinalizeShoppingList("merge", data.entries, data.selectedOrderIDs, data.providerKey, data.listName)
 		end
 	end,
 	OnCancel = function(_, data, reason)
 		-- OnCancel also fires on timeout/escape; only button2 ("New List") should act.
 		if reason == "clicked" and data and data.entries then
-			Pane:FinalizeShoppingList("new", data.entries)
+			Pane:FinalizeShoppingList("new", data.entries, data.selectedOrderIDs, data.providerKey)
 		end
 	end,
 	timeout = 0,
 	whileDead = true,
 	hideOnEscape = true,
+	-- Blizzard can pass "clicked" to OnCancel on Escape as well as button2.
+	noCancelOnEscape = true,
 }
 
-function Pane:FinalizeShoppingList(mode, entries)
+function Pane:FinalizeShoppingList(mode, entries, selectedOrderIDs, expectedProvider, targetName)
+	local provider = Pricing:GetActiveProvider()
+	if expectedProvider and (not provider or provider.key ~= expectedProvider) then
+		ns.Print(L.ERR_SHOPPING_PROVIDER_CHANGED)
+		return false
+	end
+	if not provider or provider.key ~= "auctionator" then
+		local ok, message = Pricing:ExportShoppingList(entries)
+		ns.Print(ok and message or LF("MSG_SHOPPING_LIST_EXPORT_FAILED_FORMAT", message or UNKNOWN))
+		return ok
+	end
 	local listName
-	if mode == "merge" and Pane._lastSessionListName and Pane._sessionShoppingLists[Pane._lastSessionListName] then
-		listName = Pane._lastSessionListName
+	local previousName = targetName or self._lastSessionListName
+	if mode == "merge" and previousName and self._sessionShoppingLists[previousName] then
+		if Pricing:AuctionatorListExists(previousName) == false then
+			self._sessionShoppingLists[previousName] = nil
+			if self._lastSessionListName == previousName then self._lastSessionListName = nil end
+			ns.Print(L.ERR_SHOPPING_LIST_REMOVED)
+			return false
+		end
+		listName = previousName
 	else
-		Pane._CleanupStaleShoppingList()
 		listName = Pane._GenerateNewSessionListName()
 	end
 
-	Pane._StoreSessionShoppingEntries(listName, entries)
-	ns.SetConfig("lastShoppingListName", listName)
-
-	local exportEntries = Pane._FlattenSessionShoppingList(listName)
+	local candidate = {}
+	for _, entry in pairs(self._sessionShoppingLists[listName] or EMPTY_LIST) do
+		Pane._MergeShoppingEntry(candidate, entry)
+	end
+	-- Re-exporting an order replaces its previous requirements, including when
+	-- its chosen material mix changed. Other selected orders remain untouched.
+	for key, entry in pairs(candidate) do
+		for orderID in pairs(selectedOrderIDs or EMPTY_LIST) do entry.orderQuantities[orderID] = nil end
+		if not next(entry.orderQuantities) then candidate[key] = nil end
+	end
+	for _, entry in ipairs(entries) do Pane._MergeShoppingEntry(candidate, entry) end
+	local exportEntries = Pane._FlattenSessionShoppingList(listName, candidate)
+	if #exportEntries == 0 then ns.Print(L.MSG_ALREADY_HAVE_REAGENTS); return false end
 	local ok, message = Pricing:ExportShoppingList(exportEntries, listName)
+	if ok then
+		self._sessionShoppingLists[listName] = candidate
+		self._lastSessionListName = listName
+	end
 	ns.Print(ok and message or LF("MSG_SHOPPING_LIST_EXPORT_FAILED_FORMAT", message or UNKNOWN))
+	return ok
 end
 
 -- Auctioneer's Snatch export (Pricing:CreateAuctioneerSnatchList) has no concept of
@@ -3864,41 +3907,8 @@ function Pane._ProviderSupportsMerge()
 	return provider ~= nil and provider.key == "auctionator"
 end
 
--- The in-memory session tracking above (_sessionShoppingLists) resets every login as
--- intended, but the Auctionator list it created is real account-wide SavedVariables
--- data that otherwise lives forever -- so leftover lists from past characters/sessions
--- pile up in Auctionator. lastShoppingListName is the one persisted breadcrumb (in our
--- own SavedVariables, set in FinalizeShoppingList) pointing at the most recent list we
--- made; the first "new" list of a fresh login deletes whatever it points to, then this
--- runs at most once per login (_staleListCleanupDone) so intentional same-session "New
--- List" clicks later on never get treated as stale.
-function Pane._CleanupStaleShoppingList()
-	if Pane._staleListCleanupDone or not Pane._ProviderSupportsMerge() then
-		return
-	end
-	Pane._staleListCleanupDone = true
-
-	local staleName = ns.GetConfig("lastShoppingListName")
-	if not staleName or staleName == "" then
-		return
-	end
-
-	local manager = Auctionator and Auctionator.Shopping and Auctionator.Shopping.ListManager
-	if not (manager and type(manager.GetIndexForName) == "function" and type(manager.Delete) == "function") then
-		return
-	end
-
-	if manager:GetIndexForName(staleName) then
-		if pcall(manager.Delete, manager, staleName) then
-			ns.Print(LF("MSG_STALE_SHOPPING_LIST_CLEARED_FORMAT", staleName))
-		end
-	end
-
-	ns.SetConfig("lastShoppingListName", nil)
-end
-
 function Pane:CreateShoppingList()
-	local entries, selectedCount, skippedEntries = self:CollectShoppingEntries()
+	local entries, selectedCount, skippedEntries, selectedOrderIDs = self:CollectShoppingEntries(Pane._ProviderSupportsMerge())
 	if selectedCount == 0 then
 		ns.Print(L.MSG_SELECT_ORDERS_FIRST)
 		return
@@ -3913,10 +3923,16 @@ function Pane:CreateShoppingList()
 		return
 	end
 
+	if Pane._lastSessionListName and Pricing:AuctionatorListExists(Pane._lastSessionListName) == false then
+		Pane._sessionShoppingLists[Pane._lastSessionListName] = nil
+		Pane._lastSessionListName = nil
+	end
 	if Pane._ProviderSupportsMerge() and Pane._lastSessionListName and Pane._sessionShoppingLists[Pane._lastSessionListName] then
-		StaticPopup_Show("CRAFTINGORDERSPP_MERGE_SHOPPING_LIST", Pane._lastSessionListName, #entries, { entries = entries })
+		StaticPopup_Show("CRAFTINGORDERSPP_MERGE_SHOPPING_LIST", Pane._lastSessionListName, #entries, {
+			entries = entries, selectedOrderIDs = selectedOrderIDs, providerKey = "auctionator", listName = Pane._lastSessionListName,
+		})
 	else
-		self:FinalizeShoppingList("new", entries)
+		self:FinalizeShoppingList("new", entries, selectedOrderIDs)
 	end
 end
 
@@ -4860,6 +4876,12 @@ function Pane:ShouldQueueOpenRequest(profession)
 	if not profession then
 		return false
 	end
+	-- A successful empty response is still a completed request. Do not poll the
+	-- server again on every CAN_REQUEST event while no patron orders exist.
+	if self:HasSuccessfulRequestForVisibleSession(profession)
+		and not self:HasTimedOutRequestForVisibleSession(profession) then
+		return false
+	end
 
 	return self.ordersProfession ~= profession
 		or not self:HasVisibleOrdersForProfession(profession)
@@ -5420,7 +5442,8 @@ function Pane:InitializeEvents()
 		Pane:MarkDirty("rewards")
 	end)
 
-	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function(_, itemID)
+	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function(_, itemID, success)
+		if success == false then return end
 		if Pane.root
 			and Pane.root:IsShown()
 			and type(itemID) == "number"

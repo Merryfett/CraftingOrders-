@@ -324,6 +324,14 @@ function Pricing:GetTotalPrice(item, count)
 	return priceInfo.totalPrice, priceInfo.providerKey, priceInfo.unitPrice, priceInfo.state
 end
 
+function Pricing:AuctionatorListExists(listName)
+	local manager = Auctionator and Auctionator.Shopping and Auctionator.Shopping.ListManager
+	if not (manager and type(manager.GetIndexForName) == "function") then return nil end
+	local ok, index = pcall(manager.GetIndexForName, manager, listName)
+	if ok then return index ~= nil end
+	return nil
+end
+
 local function MarkAuctionatorListTemporary(listName)
 	local manager = Auctionator and Auctionator.Shopping and Auctionator.Shopping.ListManager
 	if not (manager and type(manager.GetIndexForName) == "function" and type(manager.GetByIndex) == "function") then
@@ -357,6 +365,9 @@ function Pricing:CreateAuctionatorShoppingList(entries, listName)
 			local refreshedLink = entry.itemID and Util.GetItemLink(entry.itemID) or nil
 			local itemIdentity = (type(entry.itemLink) == "string" and entry.itemLink:find("item:") and entry.itemLink) or refreshedLink or entry.itemIdentity or entry.itemID
 			local searchName = entry.name or Util.GetItemName(itemIdentity)
+			if not searchName then
+				return false, L.ERR_SHOPPING_ITEM_NOT_READY
+			end
 			if searchName then
 				local term = {
 					searchString = searchName,
@@ -374,6 +385,8 @@ function Pricing:CreateAuctionatorShoppingList(entries, listName)
 				if ok and searchString then
 					searchStrings[#searchStrings + 1] = searchString
 					exportedEntries[#exportedEntries + 1] = entry
+				else
+					return false, L.ERR_SHOPPING_SEARCH_FAILED
 				end
 			end
 		end
