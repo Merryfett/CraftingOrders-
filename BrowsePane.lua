@@ -4761,7 +4761,10 @@ function Pane:HasTimedOutRequestForVisibleSession(profession)
 end
 
 function Pane:NeedsPreparedOrderRebuild(profession)
-	return profession ~= nil
+	-- Readiness/show events can arrive while this generation is being prepared.
+	-- Its visible generation stays old until commit; restarting here starves it.
+	return not self.preparationPending
+		and profession ~= nil
 		and self.ordersProfession == profession
 		and (self.ordersGeneration or 0) ~= (self.rebuildGeneration or 0)
 end
