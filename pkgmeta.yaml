@@ -2,8 +2,6 @@ package-as: CraftingOrders++
 
 ignore:
   - AGENTS.md
-  - tests
-  - .github
 
 optional-dependencies:
   - auctionator
